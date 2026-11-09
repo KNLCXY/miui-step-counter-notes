@@ -1,131 +1,132 @@
 # MIUI / 澎湃OS 计步链路笔记
 
-> 把小米手机上"步数"这件事拆开：数据从传感器到排行榜，中间经过哪几层、每层归谁管、
-> 什么能改什么不能改。**只讲机制，不提供成品刷步工具。**
+小米手机上"步数"这件事，被拆在四个不同的地方：传感器、系统服务、数据库、ContentProvider，
+最后还要经过 App 和它的服务端。这份笔记把它们串成一条线，并给出一份**只读**诊断脚本。
 
-- 环境：Redmi Turbo 4（`rodin` / `24129RT7CC`），HyperOS `OS2.0.103.0.VOJCNXM`，Android 15，kernel `6.6.30`
-- 结论基于真机实测 + 反编译/源码对照，凡是没验证过的都会明确标注
-
----
-
-## 一、一句话结论
-
-> 手机里的"今日步数"不是一个数字，而是**一条流水线**：
-> 传感器 → 系统步数服务 → 数据库 → ContentProvider → 各 App → 各家服务端。
-> 你在某一层看到的数字变了，不代表下一层也跟着变。
-
-最常见的困惑——"我改了步数，微信排行榜没动"——原因就在这条链的**最后两跳**：
-App 有自己的拉取节奏，排行榜又由**服务端**决定。
+- 实测环境：Redmi Turbo 4（`rodin` / `24129RT7CC`），HyperOS `OS2.0.103.0.VOJCNXM`，Android 15，kernel `6.6.30`
+- 结论都标了证据等级，没验证过的会明说
 
 ---
 
-## 二、四层架构
+## 一、这个仓库是干什么的
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ ① 硬件传感器                                                  │
-│    step_count      android.sensor.step_counter(19)  xiaomi    │
-│    step_detect     android.sensor.step_detector(18) xiaomi    │
-│    权限：android.permission.ACTIVITY_RECOGNITION              │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ 累计值（开机以来）
-┌───────────────────────────▼─────────────────────────────────┐
-│ ② 系统步数服务（system_server 内）                             │
-│    com.miui.server.stepcounter.StepCounterManagerService     │
-│    参数：Delay（自动刷新，默认 300s）/ Record Delay（默认 30s） │
-│    私有调试接口：cmd miui_step_counter_service …               │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ 落库
-┌───────────────────────────▼─────────────────────────────────┐
-│ ③ 数据库                                                      │
-│    /data/data/com.miui.rom/databases/Steps.db                │
-│    表 StepsTable(_id,_begin_time,_end_time,_mode,_steps)      │
-│    实测：22060 条 / 覆盖 2026-04-09 起，单段约 30 秒           │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ 对外暴露
-┌───────────────────────────▼─────────────────────────────────┐
-│ ④ ContentProvider                                             │
-│    content://com.miui.providers.steps/item                    │
-│    实现：com.miui.rom/miui.stepcounter.StepProvider           │
-│    权限：miui.permission.READ_STEPS / WRITE_STEPS（签名级）    │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ 被读取
-                ┌───────────┴────────────┐
-                ▼                        ▼
-      小米运动健康 / 微信 /          调试通道
-      支付宝 / QQ（持 READ_STEPS）   adb shell dumpsys …（无需权限）
-```
+**解决四类具体问题：**
 
-细节见 [`docs/data-flow.md`](docs/data-flow.md)。
-
----
-
-## 三、几个"反常识"的实测结论
-
-| 结论 | 证据 |
+| 你遇到的 | 这里能给你 |
 |---|---|
-| **root（uid=0）读不了 Provider** | `content query` 报 `SecurityException`：需要 `ACTIVITY_RECOGNITION`；权限校验看的是**权限**，不是 uid |
-| **shell 能看全部步数** | `dumpsys miui_step_counter_service` 无需任何权限，直接输出今日总量 + 逐段历史 |
-| **改库会影响一批 App，但不是全部** | 小米健康首页显示的是**它自己算的数**，改库后没跟着变；微信/支付宝会跟着变 |
-| **微信自己也读传感器** | `dumpsys sensorservice` 里 `com.tencent.mm.plugin.sport` 有 60+ 处订阅 |
-| **排行榜是服务端数据** | 本地改库当天能上榜，但把本地回滚后，**服务端记录不回滚** |
+| 走了很多路，步数不涨/不涨够 | 知道卡在哪一层，用一命令确认是"没落库"还是"App 没读" |
+| 改了数据，App 里毫无反应 | 看懂 App 读的是哪份数据（很多 App 有自己的一份） |
+| 排行榜数字对不上 | 明白排行榜读的是**服务端**，本地改动不会回滚服务端 |
+| 想知道"谁能看到我的步数" | 列出实际持有 `READ_STEPS` 权限的 App |
+
+**它不做什么：**
+
+- 不提供改步数的成品工具（只讲机制，附只读诊断）
+- 不涉及破解、不篡改系统分区
+- 不保证换机型/换系统版本后仍然成立——每次先跑诊断脚本确认
 
 ---
 
-## 四、私有 cmd 接口（公开资料里查不到的部分）
+## 二、一句话结论
 
-```
-cmd miui_step_counter_service --help
-  trim-all                 立刻把缓存步数写进数据库
-  set-delay DELAY          设置自动刷新间隔（默认 300s）
-  set-record-delay DELAY   设置记录最小间隔（默认 30s）
-  disable                  停用（不建议）
-  logging-enable/disable   日志开关
-```
+> 手机里的"今日步数"不是一个数字，而是一条**流水线**。
+> 你在某一层看到的数变了，不代表下一层也跟着变。
 
-完整说明与实测输出见 [`docs/cmd-interface.md`](docs/cmd-interface.md)。
+最常见的困惑"我改了步数，排行榜没动"，答案就在这条链的最后两跳：
+**App 有自己的拉取节奏，排行榜又由服务端决定。**
 
 ---
 
-## 五、快速开始（只读诊断）
+## 三、原理：四层 + 一跳
 
-需要：`adb` 可用、手机连上（root 可选，只影响能否导出数据库）。
+```
+① 传感器          step_count(19) / step_detect(18)
+   硬件             需要 ACTIVITY_RECOGNITION
+        │ 开机以来的累计值
+        ▼
+② 系统步数服务     system_server 里的 StepCounterManagerService
+   谁在管          Delay=300s（自动刷新） Record Delay=30s（记录粒度）
+        │ 按节奏落库
+        ▼
+③ 数据库           /data/data/com.miui.rom/databases/Steps.db
+   存什么          StepsTable(_id,_begin_time,_end_time,_mode,_steps)
+        │ 对外提供
+        ▼
+④ ContentProvider  content://com.miui.providers.steps/item
+   谁能读          miui.permission.READ_STEPS（签名级白名单）
+        │
+        ▼
+⑤ App → 服务端     小米健康 / 微信 / 支付宝 / QQ
+                   App 自己决定何时读、何时上报；排行榜以服务端为准
+```
+
+### 每一层谁说了算
+
+| 层 | 归谁 | 延迟特性 |
+|---|---|---|
+| ① 传感器 | 硬件 + 传感器 HAL | 实时 |
+| ② 服务 | `system_server` | **受 `Delay` 控制，默认 300 秒一批** |
+| ③ 数据库 | 上面的服务写入 | 跟随服务节奏 |
+| ④ Provider | `com.miui.rom` 的 `StepProvider` | 查询即时，返回当前库里的值 |
+| ⑤ App / 服务端 | 各家自己 | **手机端无法控制** |
+
+**所以"能优化的"只有中间两跳**。想知道具体怎么触发，见
+[`docs/cmd-interface.md`](docs/cmd-interface.md)（系统有一个未公开的 cmd 接口，可以强制落库、调整刷新间隔）。
+
+---
+
+## 四、几个反常识的实测结论
+
+| 结论 | 依据 |
+|---|---|
+| **root 也读不了 Provider** | 它校验的是权限不是 uid；`content query` 直接 `SecurityException` |
+| **shell 反而能看全部步数** | `dumpsys miui_step_counter_service` 无需任何权限，输出今日总量 + 逐段历史 |
+| **小米健康显示的不是这个库的数** | 它有自己的一套缓存（Realm + MMKV），改库后首页数字可能不动 |
+| **微信自己也订阅传感器** | `dumpsys sensorservice` 里 `com.tencent.mm.plugin.sport` 有 60+ 处订阅 |
+| **排行榜是服务端数据** | 本地改完当天能上榜；把本地还原后，服务端的记录不会跟着回滚 |
+
+---
+
+## 五、快速开始
+
+需要 `adb` 可用、手机连上（root 可选，只影响能否导出数据库）。
 
 ```bash
-python scripts/diagnose.py            # 全量体检
-python scripts/diagnose.py --db       # 额外导出 Steps.db 并统计（需要 root）
+python scripts/diagnose.py          # 基础体检
+python scripts/diagnose.py --db     # 额外导出 Steps.db 并统计（需要 root）
 ```
 
-输出示例（节选）：
+输出示例：
 
 ```
-[设备] Redmi Turbo 4 / OS2.0.103.0.VOJCNXM / Android 15
-[服务] Delay=300s  RecordDelay=30s
-[今日] 3131 步（walk 3131 / run 0 / treadmill 0）
-[片段] 21:16:05-21:16:06  12 步
-[权限] shell 查询 Provider → 拒绝（需要 miui.permission.READ_STEPS）
+[设备]   24129RT7CC / rodin / OS2.0.103.0.VOJCNXM / Android 15
+[传感器] step_count(19)、step_detect(18)
+[服务]   Delay=300s  RecordDelay=30s  Today Total=3131（walk 3131）
+[片段]   17:24:40-17:24:44  15 步
+[权限]   shell 查询 Provider → 拒绝（miui.permission.READ_STEPS）
+[持有]   小米运动健康 / 微信 / 支付宝 / QQ
 ```
 
 ---
 
 ## 六、文档索引
 
-| 文件 | 内容 |
+| 文件 | 讲什么 |
 |---|---|
-| [`docs/data-flow.md`](docs/data-flow.md) | 四层链路详解：谁写、谁读、延迟在哪 |
-| [`docs/cmd-interface.md`](docs/cmd-interface.md) | 私有 cmd 接口全表 + 实测输出 + 语义 |
-| [`docs/provider.md`](docs/provider.md) | Provider URI、列名、mode 取值、权限模型 |
-| [`docs/faq.md`](docs/faq.md) | 常见问题：不生效、延迟、重复条目、清零 |
+| [`docs/data-flow.md`](docs/data-flow.md) | 五段链路的逐层详解：谁写、谁读、延迟卡在哪、证据是什么 |
+| [`docs/cmd-interface.md`](docs/cmd-interface.md) | 未公开的 `cmd miui_step_counter_service` 接口全表 + 实测输出 + 语义 |
+| [`docs/provider.md`](docs/provider.md) | Provider 的 URI、列名、mode 取值、权限模型、三种读取方式 |
+| [`docs/faq.md`](docs/faq.md) | 10 个高频问题，每条都附"自己怎么验证" |
 
 ---
 
 ## 七、标记约定
 
-本文档里每个结论都会带一个标记：
+文中每个结论都带一个标记，方便你判断可信度：
 
 | 标记 | 含义 |
 |---|---|
-| 【实测】 | 在本机（见顶部环境）跑过命令、看过输出 |
+| 【实测】 | 在本文档顶部的设备上真跑过、看过输出 |
 | 【源码】 | 从 APK/JAR/dumpsys 行为推断，未逐行验证 |
 | 【官方】 | 小米开发者文档里写明 |
 | 【社区】 | 网上说法，**未独立验证**，仅供参考 |
@@ -134,9 +135,9 @@ python scripts/diagnose.py --db       # 额外导出 Steps.db 并统计（需要
 
 ## 八、免责声明
 
-- 本项目是**技术记录 + 只读诊断**，不包含任何修改步数的成品工具。
+- 本项目是**技术记录 + 只读诊断**，不含任何修改步数的成品工具。
 - 修改健康数据可能违反第三方平台（微信运动、支付宝运动等）的用户协议，后果自负。
-- 私有接口随系统版本变化，换机型/换版本前请先跑一次诊断脚本确认。
+- 私有接口随系统版本变化，换机型/版本前请先跑诊断脚本确认。
 - 仅在自己的设备上使用。
 
 MIT License.
