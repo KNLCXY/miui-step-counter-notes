@@ -8,7 +8,7 @@
 用法：
   python diagnose.py            # 基础体检
   python diagnose.py --db       # 额外导出 Steps.db 并统计（需要 root）
-  python diagnose.py --serial X84HXGNRAE6LHMKR
+  python diagnose.py --serial <你的设备序列号>
 """
 import argparse
 import os

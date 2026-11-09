@@ -47,7 +47,10 @@ python StepLocal.py rollback 3         # 回滚到编号 3；省略编号=最新
 python StepLocal.py restore            # 等同 rollback 最新
 ```
 
-Windows 用户直接 `python StepLocal.py ...` 即可，不需要额外的批处理文件。
+**Windows 用户**：双击 `Step.bat` 即可，菜单式操作，不需要命令行。
+它会在 `python` / `py -3` 之间自动找解释器；找不到会提示你安装 Python 3.8+。
+
+**其他平台**：直接 `python StepLocal.py <命令>`。
 
 ---
 
