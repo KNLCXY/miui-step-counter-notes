@@ -54,6 +54,20 @@ python StepLocal.py restore            # 等同 rollback 最新
 
 ---
 
+## 多设备
+
+```bash
+python StepLocal.py devices                     # 列出已连接设备
+python StepLocal.py status --serial 1234abcd    # 指定设备执行
+python StepLocal.py set 20000 --serial 1234abcd
+```
+
+- 只连一台时**自动使用**，不用带参数
+- 连了多台又没指定 `--serial`，会列出编号让你选
+- Windows 启动器菜单里的 `d` 就是这条命令
+
+---
+
 ## 内置的几道保险
 
 | 保险 | 说明 |

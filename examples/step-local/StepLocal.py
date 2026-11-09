@@ -2,24 +2,27 @@
 """MIUI 步数工具（示例脚本，不维护）
 
 !! 免责声明 !!
-  这是随博客/笔记一起放出的示例代码，作者不承诺维护、不保证在你的设备上可用。
-  它直接改写系统数据库 /data/data/com.miui.rom/databases/Steps.db。
-  使用前请自行确认：手机已 root、adb 可用、你愿意承担数据异常/账号风控的后果。
+  这是随笔记一起放出的示例代码，作者不承诺维护、不保证在你的设备上可用。
+  它会改写系统数据库 /data/data/com.miui.rom/databases/Steps.db。
+  使用前请确认：手机已 root、adb 可用、你愿意承担数据异常/账号风控的后果。
 
-依赖：adb 在 PATH 中（或设置环境变量 ADB）、Python 3.8+
-测试环境：Redmi Turbo 4 / HyperOS OS2.0.103.0.VOJCNXM / Android 15
+依赖：adb 在 PATH 中（或设置环境变量 ADB 指向 adb.exe）、Python 3.8+
+测试环境：Xiaomi/Redmi + HyperOS 2.x + Android 15
 
 命令：
-  status               查看今日步数、最后一条记录、可用空白段
-  set 20000            把今日总步数设成 20000（补在空白时段，直到当前时刻）
-  set --live           同上，目标随机取 MIN_STEP~MAX_STEP
-  add 5000             在当前基础上再加 5000
-  lock 20000           锁住（真实步数一涨就扣回，Ctrl+C 结束）
-  sync                 立即落库 + 缩短服务刷新间隔（调私有 cmd 接口）
-  restore-delay        把刷新间隔恢复默认 300s
-  backups              列出备份（带时间）
-  rollback [编号]       回滚到指定备份，省略编号=最新
-  restore              等同 rollback 最新
+  devices                       列出已连接设备
+  status                        查看今日步数 / 最后一条 / 可用空白段
+  set 20000                     设为 20000（补在空白时段，直到当前时刻）
+  set --live                    目标随机取 MIN_STEP~MAX_STEP
+  add 5000                      在当前基础上再加
+  lock 20000                    锁定：真实步数一涨就扣回
+  sync                          立即落库 + 缩短服务刷新间隔
+  restore-delay                 恢复默认刷新间隔 300s
+  backups                       备份列表（带时间）
+  rollback [编号]                回滚到指定备份，省略=最新
+  restore                       等同 rollback 最新
+
+多设备：所有命令都支持 --serial <序列号>，或 -s <序列号>。
 
 原理与链路说明见仓库 README 与 docs/。
 """
@@ -34,6 +37,7 @@ import sys
 import time
 
 ADB = os.environ.get("ADB", "adb")
+SERIAL = ""
 HERE = os.path.dirname(os.path.abspath(__file__))
 TMP_LOCAL = os.path.join(HERE, "_work.db")
 DEVICE_DB = "/data/data/com.miui.rom/databases/Steps.db"
@@ -55,13 +59,72 @@ ADB_RAW = ("pull", "push", "devices", "install", "uninstall", "shell", "connect"
 def adb(*args, su=False, timeout=60):
     """默认把参数当作设备上的 shell 命令；pull/push 等直接透传。"""
     parts = list(args)
+    base = [ADB] + (["-s", SERIAL] if SERIAL else [])
     if su:
-        cmd = [ADB, "shell", "su -c '" + " ".join(parts) + "'"]
+        cmd = base + ["shell", "su -c '" + " ".join(parts) + "'"]
     elif parts and parts[0] in ADB_RAW:
-        cmd = [ADB] + parts
+        cmd = base + parts
     else:
-        cmd = [ADB, "shell", " ".join(parts)]
+        cmd = base + ["shell", " ".join(parts)]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def list_devices():
+    """返回 [(serial, state), …]"""
+    try:
+        r = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            out.append((parts[0], parts[1]))
+    return out
+
+
+def cmd_devices():
+    devs = list_devices()
+    if not devs:
+        print("没有检测到设备：请确认 USB 连接、已开启 USB 调试并授权本机")
+        return
+    print(f"检测到 {len(devs)} 台设备：")
+    for i, (serial, state) in enumerate(devs, 1):
+        mark = " ← 当前" if serial == SERIAL else ""
+        print(f"  {i}. {serial}  [{state}]{mark}")
+    if len(devs) == 1:
+        print("\n只有一台，直接用即可；多设备时用 --serial 指定，例如：")
+        print(f"  python StepLocal.py status --serial {devs[0][0]}")
+    else:
+        print("\n用 --serial 指定目标，例如：")
+        print(f"  python StepLocal.py status --serial {devs[0][0]}")
+
+
+def pick_device(serial=None):
+    """确定要操作的设备：显式指定 > 唯一设备 > 交互选择"""
+    global SERIAL
+    devs = [d for d, st in list_devices() if st == "device"]
+    if serial:
+        if serial not in devs:
+            print(f"!! 设备 {serial} 不在线（在线：{', '.join(devs) or '无'}）")
+            sys.exit(2)
+        SERIAL = serial
+        return
+    if len(devs) == 1:
+        SERIAL = devs[0]
+        return
+    if not devs:
+        print("!! 没有可用设备")
+        sys.exit(2)
+    print("检测到多台设备：")
+    for i, d in enumerate(devs, 1):
+        print(f"  {i}. {d}")
+    try:
+        idx = int(input("选择设备编号: ").strip())
+        SERIAL = devs[idx - 1]
+    except Exception:
+        print("!! 输入无效")
+        sys.exit(2)
 
 
 def read_total():
@@ -445,10 +508,32 @@ def cmd_restore():
 
 def main():
     a = sys.argv[1:]
+    serial = None
+    cleaned = []
+    i = 0
+    while i < len(a):
+        if a[i] in ("-s", "--serial") and i + 1 < len(a):
+            serial = a[i + 1]
+            i += 2
+            continue
+        if a[i].startswith("--serial="):
+            serial = a[i].split("=", 1)[1]
+            i += 1
+            continue
+        cleaned.append(a[i])
+        i += 1
+    a = cleaned
+
     if not a:
         print(__doc__)
         return
     c = a[0]
+
+    if c in ("devices", "dev"):
+        cmd_devices()
+        return
+    if c not in ("-h", "--help", "help"):
+        pick_device(serial)
     if c == "status":
         cmd_status()
     elif c == "set":

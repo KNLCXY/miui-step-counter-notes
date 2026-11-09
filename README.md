@@ -47,7 +47,7 @@
 ├─ scripts/
 │  └─ diagnose.py         只读诊断：属性 / 传感器 / 服务参数 / 权限 / 可选导出统计
 └─ examples/
-   └─ step-local/         示例脚本（可写库，不维护，用前先看它的 README）
+   └─ step-local/         示例脚本（可写库，不维护；支持多设备 --serial）
 ```
 
 **适用范围**：Android 逆向与系统调试爱好者、遇到步数不同步问题的小米用户、
